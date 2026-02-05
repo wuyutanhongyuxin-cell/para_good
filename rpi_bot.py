@@ -718,13 +718,8 @@ class RPIBot:
                     if self.config.price_momentum_min_slope > 0 and slope_pct_val < self.config.price_momentum_min_slope:
                         log.info(f"[信号过滤] RSI={rsi:.1f} 满足, 但 slope_pct={slope_pct_val:.4f}% < {self.config.price_momentum_min_slope}% 动量不足")
                         return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 动量不足"
-
-                    if len(prices) >= 3 and prices[-1] - prices[-2] >= (prices[-2] - prices[-3]) * 0.5:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做多条件，确认入场")
-                        return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做多确认"
-                    elif len(prices) >= 3:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 但趋势放缓")
-                        return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 趋势放缓"
+                    # RSI和动量均满足，确认做多
+                    log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做多条件，确认入场")
                     return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做多确认"
                 log.info(f"[信号过滤] RSI={rsi:.1f} < {self.config.rsi_trend_threshold}，不满足做多")
                 return False, f"RSI={rsi:.1f} 低于阈值"
@@ -735,13 +730,8 @@ class RPIBot:
                     if self.config.price_momentum_min_slope > 0 and slope_pct_val > -self.config.price_momentum_min_slope:
                         log.info(f"[信号过滤] RSI={rsi:.1f} 满足, 但 slope_pct={slope_pct_val:.4f}% > -{self.config.price_momentum_min_slope}% 动量不足")
                         return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 动量不足"
-
-                    if len(prices) >= 3 and prices[-1] - prices[-2] <= (prices[-2] - prices[-3]) * 0.5:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做空条件，确认入场")
-                        return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做空确认"
-                    elif len(prices) >= 3:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 但下跌趋势放缓")
-                        return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 趋势放缓"
+                    # RSI和动量均满足，确认做空
+                    log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做空条件，确认入场")
                     return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做空确认"
                 log.info(f"[信号过滤] RSI={rsi:.1f} > {self.config.rsi_trend_threshold}，不满足做空")
                 return False, f"RSI={rsi:.1f} 高于阈值"
@@ -1249,8 +1239,16 @@ class RPIBot:
             size = str(round(float(size) * time_mult, 6))
             log.info(f"[时段] 仓位调整: x{time_mult} -> {size}")
 
-        # 余额检查
+        # 仓位硬上限检查
         leverage = 50
+        position_value = float(size) * ask
+        max_position_value = balance * self.config.max_position_pct * leverage
+        if position_value > max_position_value:
+            original_size = size
+            size = str(round(max_position_value / ask, 6))
+            log.info(f"[仓位上限] 目标仓位超出上限，已缩减为 {size} BTC (原: {original_size} BTC, 上限: {self.config.max_position_pct*100:.0f}%余额)")
+
+        # 余额检查
         required = float(size) * ask / leverage * 1.5
         if balance < required:
             return False, f"余额不足: {balance:.2f} < {required:.2f}"
@@ -1466,6 +1464,7 @@ def print_final_config(config: RPIConfig):
     log.info(f"  kelly_enabled: {config.kelly_enabled}")
     log.info(f"  kelly_fraction: {config.kelly_fraction}")
     log.info(f"  max_position_increase_pct: {config.max_position_increase_pct*100:.0f}%")
+    log.info(f"  max_position_pct: {config.max_position_pct*100:.0f}% (仓位硬上限)")
     log.info("")
     log.info("[回撤控制]")
     log.info(f"  drawdown_control_enabled: {config.drawdown_control_enabled}")
