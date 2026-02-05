@@ -130,6 +130,13 @@ class RPIConfig:
     max_total_loss_pct: float = 0.10
 
     # ===== v3.1 做空交易配置 =====
+
+    # ===== v3.2 方向一致性过滤 =====
+    direction_trend_confirm: bool = True  # 订单簿方向需与微趋势一致
+
+    # ===== v3.2 动量过滤配置 =====
+    price_momentum_window: int = 6  # 动量计算窗口
+    price_momentum_min_slope: float = 0.0  # 最小斜率阈值(%)
     enable_short: bool = True  # 是否启用做空交易
 
     enabled: bool = True
