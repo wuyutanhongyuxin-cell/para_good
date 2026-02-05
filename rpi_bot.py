@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RPI Bot - 100% RPI 触发交易机器人 (v3.1 双向交易版)
+RPI Bot - 100% RPI 触发交易机器人 (v3.2 双向交易版)
 
 核心原理:
     RPI (Rebate Point Index) 只出现在 TAKER 订单上
@@ -12,6 +12,11 @@ v3.1 新增功能:
     - 双向交易支持 (做多/做空)
     - 对称的止盈止损逻辑
     - 可配置的做空开关
+
+v3.2 新增功能:
+    - 方向一致性过滤 (订单簿方向需与微趋势一致)
+    - 动量过滤 (线性回归斜率检查)
+    - 完整的环境变量配置支持
 
 基于 pp2 项目改进: https://github.com/wuyutanhongyuxin-cell/pp2
 """
@@ -130,14 +135,14 @@ class RPIConfig:
     max_total_loss_pct: float = 0.10
 
     # ===== v3.1 做空交易配置 =====
+    enable_short: bool = True
 
     # ===== v3.2 方向一致性过滤 =====
-    direction_trend_confirm: bool = True  # 订单簿方向需与微趋势一致
+    direction_trend_confirm: bool = True
 
     # ===== v3.2 动量过滤配置 =====
-    price_momentum_window: int = 6  # 动量计算窗口
-    price_momentum_min_slope: float = 0.0  # 最小斜率阈值(%)
-    enable_short: bool = True  # 是否启用做空交易
+    price_momentum_window: int = 6
+    price_momentum_min_slope: float = 0.0
 
     enabled: bool = True
 
@@ -414,16 +419,16 @@ class ParadexInteractiveClient:
                     if resp.status != 200:
                         return 0
                     orders = (await resp.json()).get("results", [])
-                cancelled = 0
-                for order in orders:
-                    oid = order.get("id")
-                    if oid:
-                        async with session.delete(f"{self.base_url}/orders/{oid}", headers=self._get_auth_headers()) as r:
-                            if r.status in [200, 204]:
-                                cancelled += 1
-                if cancelled:
-                    log.info(f"已取消 {cancelled}/{len(orders)} 个挂单")
-                return cancelled
+                    cancelled = 0
+                    for order in orders:
+                        oid = order.get("id")
+                        if oid:
+                            async with session.delete(f"{self.base_url}/orders/{oid}", headers=self._get_auth_headers()) as r:
+                                if r.status in [200, 204]:
+                                    cancelled += 1
+                    if cancelled:
+                        log.info(f"已取消 {cancelled}/{len(orders)} 个挂单")
+                    return cancelled
         except Exception as e:
             log.error(f"取消订单失败: {e}")
             return 0
@@ -540,11 +545,11 @@ class AccountManager:
 
 
 # =============================================================================
-# RPI 交易机器人 (v3.1 双向交易版)
+# RPI 交易机器人 (v3.2 双向交易版)
 # =============================================================================
 
 class RPIBot:
-    """RPI 机器人 v3.1 - 支持双向交易"""
+    """RPI 机器人 v3.2 - 支持双向交易和动量过滤"""
 
     def __init__(self, client: ParadexInteractiveClient, config: RPIConfig,
                  account_manager: Optional[AccountManager] = None):
@@ -555,8 +560,8 @@ class RPIBot:
 
         self.total_trades = 0
         self.rpi_trades = 0
-        self.long_trades = 0  # 做多交易计数
-        self.short_trades = 0  # 做空交易计数
+        self.long_trades = 0
+        self.short_trades = 0
         self.start_time = None
         self.session_start_balance: Optional[float] = None
         self.daily_start_balance: Optional[float] = None
@@ -646,48 +651,108 @@ class RPIBot:
             return 100.0
         return 100 - (100 / (1 + avg_gain / avg_loss))
 
+    def _calculate_momentum_slope(self, prices: List[float]) -> Optional[float]:
+        """
+        计算价格动量斜率 (线性回归)
+        返回: 斜率百分比 (slope_pct)
+        """
+        n = len(prices)
+        if n < 2:
+            return None
+
+        # 简单线性回归: y = ax + b
+        # a = (n * sum(xy) - sum(x) * sum(y)) / (n * sum(x^2) - sum(x)^2)
+        x_sum = sum(range(n))
+        y_sum = sum(prices)
+        xy_sum = sum(i * p for i, p in enumerate(prices))
+        x2_sum = sum(i * i for i in range(n))
+
+        denominator = n * x2_sum - x_sum * x_sum
+        if denominator == 0:
+            return 0.0
+
+        slope = (n * xy_sum - x_sum * y_sum) / denominator
+
+        # 转换为百分比 (相对于平均价格)
+        avg_price = y_sum / n
+        if avg_price == 0:
+            return 0.0
+
+        slope_pct = (slope / avg_price) * 100
+        return slope_pct
+
     def _is_signal_confirmed(self, prices: List[float], direction: str) -> tuple:
-        """确认入场信号 (RSI过滤) - 支持做多和做空"""
+        """确认入场信号 (RSI过滤 + 动量过滤) - 支持做多和做空"""
+        rsi = self._calculate_rsi(prices, self.config.rsi_period)
+
+        # 动量计算
+        momentum_window = min(self.config.price_momentum_window, len(prices))
+        momentum_prices = prices[-momentum_window:] if momentum_window > 0 else prices
+        slope_pct = self._calculate_momentum_slope(momentum_prices)
+        slope_pct_val = slope_pct if slope_pct is not None else 0.0
+
         if not self.config.rsi_filter_enabled:
+            # 只做动量检查
+            if self.config.price_momentum_min_slope > 0:
+                if direction == "LONG":
+                    if slope_pct_val >= self.config.price_momentum_min_slope:
+                        log.info(f"[信号过滤] RSI过滤关闭, slope_pct={slope_pct_val:.4f}% 满足做多动量")
+                        return True, f"slope_pct={slope_pct_val:.4f}% 做多确认"
+                    log.info(f"[信号过滤] RSI过滤关闭, slope_pct={slope_pct_val:.4f}% < {self.config.price_momentum_min_slope}% 动量不足")
+                    return False, f"slope_pct={slope_pct_val:.4f}% 动量不足"
+                elif direction == "SHORT":
+                    if slope_pct_val <= -self.config.price_momentum_min_slope:
+                        log.info(f"[信号过滤] RSI过滤关闭, slope_pct={slope_pct_val:.4f}% 满足做空动量")
+                        return True, f"slope_pct={slope_pct_val:.4f}% 做空确认"
+                    log.info(f"[信号过滤] RSI过滤关闭, slope_pct={slope_pct_val:.4f}% > -{self.config.price_momentum_min_slope}% 动量不足")
+                    return False, f"slope_pct={slope_pct_val:.4f}% 动量不足"
             return True, "RSI过滤已关闭"
 
-        rsi = self._calculate_rsi(prices, self.config.rsi_period)
         if rsi is None:
             return True, "RSI数据不足"
 
         if self.config.entry_mode == "trend":
             if direction == "LONG":
                 if rsi > self.config.rsi_trend_threshold:
+                    # 动量检查
+                    if self.config.price_momentum_min_slope > 0 and slope_pct_val < self.config.price_momentum_min_slope:
+                        log.info(f"[信号过滤] RSI={rsi:.1f} 满足, 但 slope_pct={slope_pct_val:.4f}% < {self.config.price_momentum_min_slope}% 动量不足")
+                        return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 动量不足"
+
                     if len(prices) >= 3 and prices[-1] - prices[-2] >= (prices[-2] - prices[-3]) * 0.5:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} 满足做多条件，确认入场")
-                        return True, f"RSI={rsi:.1f} 做多确认"
+                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做多条件，确认入场")
+                        return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做多确认"
                     elif len(prices) >= 3:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} 但趋势放缓")
-                        return False, f"RSI={rsi:.1f} 趋势放缓"
-                    return True, f"RSI={rsi:.1f} 做多确认"
+                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 但趋势放缓")
+                        return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 趋势放缓"
+                    return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做多确认"
                 log.info(f"[信号过滤] RSI={rsi:.1f} < {self.config.rsi_trend_threshold}，不满足做多")
                 return False, f"RSI={rsi:.1f} 低于阈值"
 
             elif direction == "SHORT":
-                # 做空：RSI < 50 且下降
                 if rsi < self.config.rsi_trend_threshold:
+                    # 动量检查 (做空需要负斜率)
+                    if self.config.price_momentum_min_slope > 0 and slope_pct_val > -self.config.price_momentum_min_slope:
+                        log.info(f"[信号过滤] RSI={rsi:.1f} 满足, 但 slope_pct={slope_pct_val:.4f}% > -{self.config.price_momentum_min_slope}% 动量不足")
+                        return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 动量不足"
+
                     if len(prices) >= 3 and prices[-1] - prices[-2] <= (prices[-2] - prices[-3]) * 0.5:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} 满足做空条件，确认入场")
-                        return True, f"RSI={rsi:.1f} 做空确认"
+                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 满足做空条件，确认入场")
+                        return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做空确认"
                     elif len(prices) >= 3:
-                        log.info(f"[信号过滤] RSI={rsi:.1f} 但下跌趋势放缓")
-                        return False, f"RSI={rsi:.1f} 趋势放缓"
-                    return True, f"RSI={rsi:.1f} 做空确认"
+                        log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 但下跌趋势放缓")
+                        return False, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 趋势放缓"
+                    return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 做空确认"
                 log.info(f"[信号过滤] RSI={rsi:.1f} > {self.config.rsi_trend_threshold}，不满足做空")
                 return False, f"RSI={rsi:.1f} 高于阈值"
 
         elif self.config.entry_mode == "mean_reversion":
             if direction == "LONG" and rsi < self.config.rsi_oversold:
-                log.info(f"[信号过滤] RSI={rsi:.1f} 超卖，确认做多反转")
-                return True, f"RSI={rsi:.1f} 超卖反转"
+                log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 超卖，确认做多反转")
+                return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 超卖反转"
             elif direction == "SHORT" and rsi > self.config.rsi_overbought:
-                log.info(f"[信号过滤] RSI={rsi:.1f} 超买，确认做空反转")
-                return True, f"RSI={rsi:.1f} 超买反转"
+                log.info(f"[信号过滤] RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 超买，确认做空反转")
+                return True, f"RSI={rsi:.1f} slope_pct={slope_pct_val:.4f}% 超买反转"
             return False, f"RSI={rsi:.1f} 不在极值区"
 
         return True, "默认通过"
@@ -721,7 +786,7 @@ class RPIBot:
         increase = (target_size - self.last_position_size) / self.last_position_size if self.last_position_size > 0 else 0
         if increase > self.config.max_position_increase_pct:
             smoothed = self.last_position_size * (1 + self.config.max_position_increase_pct)
-            log.info(f"[仓位管理] Kelly建议{target_size:.6f} BTC，平滑后{smoothed:.6f} BTC")
+            log.info(f"[仓位管理] Kelly建议{target_size:.6f} BTC，平滑后{smoothed:.6f} BTC (最大增幅{self.config.max_position_increase_pct*100:.0f}%)")
             self.last_position_size = smoothed
             return smoothed
         self.last_position_size = target_size
@@ -740,11 +805,11 @@ class RPIBot:
         if self.daily_start_balance and self.daily_start_balance > 0:
             daily_loss = (self.daily_start_balance - balance) / self.daily_start_balance
             if daily_loss >= self.config.max_daily_loss_pct:
-                return False, f"日内回撤 {daily_loss:.1%}"
+                return False, f"日内回撤 {daily_loss:.1%} 超过阈值 {self.config.max_daily_loss_pct*100:.1f}%"
         if self.session_start_balance and self.session_start_balance > 0:
             total_loss = (self.session_start_balance - balance) / self.session_start_balance
             if total_loss >= self.config.max_total_loss_pct:
-                return False, f"总回撤 {total_loss:.1%}"
+                return False, f"总回撤 {total_loss:.1%} 超过阈值 {self.config.max_total_loss_pct*100:.1f}%"
         return True, ""
 
     def _get_direction_signal(self, imbalance: Optional[float]) -> tuple:
@@ -757,6 +822,26 @@ class RPIBot:
         elif imbalance < -threshold:
             return "SHORT", abs(imbalance)
         return "NEUTRAL", abs(imbalance)
+
+    def _check_direction_trend_confirm(self, direction: str, micro_trend: str) -> tuple:
+        """
+        方向一致性过滤 (v3.2)
+        当 config.direction_trend_confirm 为 true 时：
+        - 订单簿方向为 LONG 且微趋势为 down -> 拒绝
+        - 订单簿方向为 SHORT 且微趋势为 up -> 拒绝
+        """
+        if not self.config.direction_trend_confirm:
+            return True, ""
+
+        if direction == "LONG" and micro_trend == "down":
+            log.info(f"[方向过滤] 订单簿=LONG 微趋势=down 跳过")
+            return False, "订单簿=LONG 微趋势=down 方向不一致"
+
+        if direction == "SHORT" and micro_trend == "up":
+            log.info(f"[方向过滤] 订单簿=SHORT 微趋势=up 跳过")
+            return False, "订单簿=SHORT 微趋势=up 方向不一致"
+
+        return True, ""
 
     async def _execute_trade(self, direction: str, market: str, size: str, bid: float, ask: float,
                               stop_loss_pct: float, take_profit_pct: float) -> tuple:
@@ -781,11 +866,11 @@ class RPIBot:
         if is_long:
             entry_side = "BUY"
             entry_price = ask
-            log.info(f"[开多单] 市价买入 {size} BTC @ ~${entry_price:.1f}...")
+            log.info(f"[开多单] 市价买入 {size} BTC @ 约${entry_price:.1f}")
         else:
             entry_side = "SELL"
             entry_price = bid
-            log.info(f"[开空单] 市价卖出 {size} BTC @ ~${entry_price:.1f}...")
+            log.info(f"[开空单] 市价卖出 {size} BTC @ 约${entry_price:.1f}")
 
         open_result = await self.client.place_market_order(market=market, side=entry_side, size=size, reduce_only=False)
 
@@ -807,11 +892,9 @@ class RPIBot:
 
         # 计算止盈止损价格
         if is_long:
-            # 做多：止盈价高于入场价，止损价低于入场价
             target_price = entry_price * (1 + take_profit_pct)
             stop_price = entry_price * (1 - stop_loss_pct)
         else:
-            # 做空：止盈价低于入场价，止损价高于入场价
             target_price = entry_price * (1 - take_profit_pct)
             stop_price = entry_price * (1 + stop_loss_pct)
 
@@ -819,7 +902,7 @@ class RPIBot:
 
         # 持仓监控循环
         best_price = entry_price
-        extreme_price = entry_price  # 做多记录最高价，做空记录最低价
+        extreme_price = entry_price
         exit_reason = "timeout"
         breakeven_activated = False
         trailing_activated = False
@@ -838,10 +921,8 @@ class RPIBot:
 
                 new_bbo = await self.client.get_bbo(market)
                 if new_bbo:
-                    # 做多关注bid（卖出价），做空关注ask（买入价）
                     best_price = new_bbo["bid"] if is_long else new_bbo["ask"]
 
-                    # 更新极值价格
                     if is_long:
                         if best_price > extreme_price:
                             extreme_price = best_price
@@ -849,7 +930,6 @@ class RPIBot:
                         if best_price < extreme_price:
                             extreme_price = best_price
 
-                    # 计算浮盈
                     if is_long:
                         current_profit_pct = (best_price - entry_price) / entry_price
                     else:
@@ -862,7 +942,7 @@ class RPIBot:
                         if not breakeven_activated and profit_ratio >= self.config.breakeven_activation:
                             stop_price = entry_price
                             breakeven_activated = True
-                            log.info(f"[追踪止损] 浮盈达{profit_ratio:.1f}倍，止损上移至保本价 ${stop_price:.1f}")
+                            log.info(f"[追踪止损] 浮盈达{profit_ratio:.1f}倍保本激活阈值，止损上移至保本价 ${stop_price:.1f}")
 
                         if profit_ratio >= self.config.trailing_stop_activation:
                             trailing_activated = True
@@ -924,7 +1004,7 @@ class RPIBot:
                             extension_used = True
                             log.info(f"[延长持仓] 盈利趋势良好 (+{current_profit_pct*100:.2f}%)，延长{self.config.hold_extension_seconds:.0f}秒")
                         elif is_stagnant and current_profit_pct <= 0:
-                            log.info(f"[提前平仓] 行情停滞，提前退出")
+                            log.info(f"[提前平仓] 行情停滞 (波动<{self.config.early_exit_stagnation_threshold}%)，提前退出")
                             exit_reason = "early_exit_stagnant"
                             break
 
@@ -939,7 +1019,7 @@ class RPIBot:
 
         # 限价单平仓（非止损情况）
         if self.config.exit_order_type == "limit" and exit_reason not in ["stop_loss", "trailing_stop"]:
-            log.info(f"[平仓] 限价单{'卖出' if is_long else '买入'} {size} BTC @ ${best_price:.1f}...")
+            log.info(f"[平仓] 限价单{'卖出' if is_long else '买入'} {size} BTC @ ${best_price:.1f}")
             limit_result = await self.client.place_limit_order(
                 market=market, side=close_side, size=size,
                 price=str(round(best_price, 1)), post_only=True, reduce_only=True
@@ -951,11 +1031,11 @@ class RPIBot:
                     actual_exit_price = float(fill.get("avg_fill_price", best_price))
                     log.info(f"  -> 限价单成交 @ ${actual_exit_price:.1f}")
                 else:
-                    log.info("  -> 限价单超时，切换市价单...")
+                    log.info("  -> 限价单超时，切换市价单")
 
         # 市价单平仓
         if not close_result:
-            log.info(f"[平仓] 市价{'卖出' if is_long else '买入'} {size} BTC @ ~${best_price:.1f}...")
+            log.info(f"[平仓] 市价{'卖出' if is_long else '买入'} {size} BTC @ 约${best_price:.1f}")
             close_result = await self.client.place_market_order(market=market, side=close_side, size=size, reduce_only=True)
 
         # 兜底平仓
@@ -1008,7 +1088,7 @@ class RPIBot:
             log.info(f"[时段] {time_reason}")
 
         # 余额检查
-        log.info("[检查] 获取账户余额...")
+        log.info("[检查] 获取账户余额")
         balance = await self.client.get_balance()
         if not balance:
             return False, "无法获取余额"
@@ -1020,7 +1100,7 @@ class RPIBot:
             return False, f"回撤限制: {drawdown_reason}"
 
         # 获取市场价格
-        log.info("[检查] 获取市场价格...")
+        log.info("[检查] 获取市场价格")
         bbo = await self.client.get_bbo(market)
         if not bbo:
             return False, "无法获取市场价格"
@@ -1034,12 +1114,14 @@ class RPIBot:
             return False, f"Spread 过大: {spread_pct:.4f}%"
 
         # 波动率检测
+        micro_trend = "flat"
         if self.config.volatility_filter_enabled:
-            log.info(f"[波动率] 检测中...")
+            log.info(f"[波动率] 检测中 (窗口={self.config.volatility_window}秒)")
             vol_data = await self.client.get_price_volatility(market, self.config.volatility_window, 5)
             if vol_data:
                 volatility = vol_data["volatility_pct"]
-                log.info(f"[波动率] {volatility:.4f}% | 趋势: {vol_data['trend']}")
+                micro_trend = vol_data["trend"]
+                log.info(f"[波动率] {volatility:.4f}% | 趋势: {micro_trend}")
                 if volatility > self.config.max_volatility_pct:
                     return False, f"波动率过高: {volatility:.4f}%"
                 bid = vol_data["latest_price"]
@@ -1065,12 +1147,16 @@ class RPIBot:
         if direction == "SHORT" and not self.config.enable_short:
             return False, f"做空已禁用，跳过空头信号 (imbalance={imbalance:.2f})"
 
+        # 方向一致性过滤 (v3.2)
+        direction_ok, direction_reason = self._check_direction_trend_confirm(direction, micro_trend)
+        if not direction_ok:
+            return False, f"方向过滤: {direction_reason}"
+
         # 入场信号确认
         entry_signal = False
         entry_reason = ""
 
         if direction == "LONG":
-            # 做多信号判断
             if self.config.entry_mode in ["trend", "hybrid"]:
                 if self.config.trend_filter_enabled:
                     prices = [bid]
@@ -1107,7 +1193,6 @@ class RPIBot:
                         ask = bbo_check["ask"]
 
         elif direction == "SHORT":
-            # 做空信号判断
             if self.config.entry_mode in ["trend", "hybrid"]:
                 if self.config.trend_filter_enabled:
                     prices = [bid]
@@ -1148,7 +1233,7 @@ class RPIBot:
 
         log.info(f"[入场] {entry_reason}")
 
-        # RSI信号确认
+        # RSI + 动量信号确认
         if self.config.rsi_filter_enabled and len(self.price_history) >= self.config.rsi_period + 1:
             confirmed, filter_reason = self._is_signal_confirmed(self.price_history, direction)
             if not confirmed:
@@ -1174,7 +1259,7 @@ class RPIBot:
         if self.config.dynamic_stop_loss:
             dynamic_stop = spread_pct * self.config.stop_loss_spread_multiplier
             stop_loss_pct = max(self.config.dynamic_stop_loss_min, min(dynamic_stop, self.config.dynamic_stop_loss_max))
-            log.info(f"[开仓] 动态止损={stop_loss_pct*100:.2f}% (范围{self.config.dynamic_stop_loss_min*100:.0f}%-{self.config.dynamic_stop_loss_max*100:.0f}%)")
+            log.info(f"[开仓] 动态止损={stop_loss_pct*100:.2f}% (spread={spread_pct:.4f}% x {self.config.stop_loss_spread_multiplier}, 范围={self.config.dynamic_stop_loss_min*100:.1f}%-{self.config.dynamic_stop_loss_max*100:.1f}%)")
         else:
             stop_loss_pct = self.config.stop_loss_pct
 
@@ -1196,7 +1281,7 @@ class RPIBot:
 
     async def _cleanup_on_exit(self):
         log.info("=" * 50)
-        log.info("执行退出清理...")
+        log.info("执行退出清理")
         if self.account_manager:
             for idx, client in self.account_manager.clients.items():
                 try:
@@ -1216,7 +1301,7 @@ class RPIBot:
     async def _switch_account(self) -> str:
         if not self.account_manager:
             return "switched"
-        log.info(f"[{self.account_manager.get_current_account_name()}] 切换账号...")
+        log.info(f"[{self.account_manager.get_current_account_name()}] 切换账号")
         await self.client.cancel_all_orders(self.config.market)
         await self.client.close_all_positions(self.config.market)
         self.account_manager.save_state()
@@ -1235,26 +1320,28 @@ class RPIBot:
         self.start_time = time.time()
 
         log.info("=" * 60)
-        log.info("RPI Bot v3.1 - 双向交易版")
+        log.info("RPI Bot v3.2 - 双向交易版")
         log.info("=" * 60)
         log.info(f"市场: {self.config.market}")
         log.info(f"交易大小: {self.config.trade_size} BTC")
         log.info("")
-        log.info("v3.1 功能:")
+        log.info("v3.2 功能:")
         log.info(f"  - 做空交易: {'开启' if self.config.enable_short else '关闭'}")
         log.info(f"  - 追踪止损: {'开启' if self.config.trailing_stop_enabled else '关闭'}")
         log.info(f"  - 智能持仓: {'开启' if self.config.smart_hold_enabled else '关闭'}")
         log.info(f"  - RSI过滤: {'开启' if self.config.rsi_filter_enabled else '关闭'}")
+        log.info(f"  - 方向一致性过滤: {'开启' if self.config.direction_trend_confirm else '关闭'}")
+        log.info(f"  - 动量过滤: window={self.config.price_momentum_window}, min_slope={self.config.price_momentum_min_slope}%")
         log.info("=" * 60)
 
         if not await self.client.authenticate_interactive():
             log.error("初始认证失败!")
             return
-        log.info("认证成功，开始交易...")
+        log.info("认证成功，开始交易")
 
         while not _shutdown_requested:
             try:
-                log.info("[周期] 开始交易周期...")
+                log.info("[周期] 开始交易周期")
                 success, msg = await self.run_rpi_cycle()
 
                 if "all_accounts_exhausted" in msg:
@@ -1266,7 +1353,7 @@ class RPIBot:
                 if "switch" in msg and self.account_manager:
                     result = await self._switch_account()
                     if result == "all_hour_limited":
-                        log.info("等待 10 分钟...")
+                        log.info("等待 10 分钟")
                         await asyncio.sleep(600)
                     elif result == "all_day_limited":
                         await self._wait_until_tomorrow()
@@ -1304,7 +1391,7 @@ class RPIBot:
         now = datetime.now()
         tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
         wait_seconds = (tomorrow - now).total_seconds()
-        log.info(f"等待 {wait_seconds/3600:.1f} 小时...")
+        log.info(f"等待 {wait_seconds/3600:.1f} 小时")
         await asyncio.sleep(wait_seconds + 60)
 
 
@@ -1326,6 +1413,74 @@ def parse_accounts(accounts_str: str) -> List[AccountInfo]:
             if pk.startswith("0x") and addr.startswith("0x"):
                 accounts.append(AccountInfo(pk, addr, f"账号#{i+1}"))
     return accounts
+
+
+def print_final_config(config: RPIConfig):
+    """打印最终生效配置"""
+    log.info("")
+    log.info("=" * 60)
+    log.info("最终生效配置")
+    log.info("=" * 60)
+    log.info("")
+    log.info("[核心交易参数]")
+    log.info(f"  trade_size: {config.trade_size}")
+    log.info(f"  trade_interval: {config.trade_interval}s")
+    log.info(f"  max_spread_pct: {config.max_spread_pct}%")
+    log.info(f"  max_wait_seconds: {config.max_wait_seconds}s")
+    log.info(f"  check_interval: {config.check_interval}s")
+    log.info("")
+    log.info("[动态止损]")
+    log.info(f"  dynamic_stop_loss: {config.dynamic_stop_loss}")
+    log.info(f"  stop_loss_spread_multiplier: {config.stop_loss_spread_multiplier}")
+    log.info(f"  dynamic_stop_loss_min: {config.dynamic_stop_loss_min*100:.2f}%")
+    log.info(f"  dynamic_stop_loss_max: {config.dynamic_stop_loss_max*100:.2f}%")
+    log.info(f"  risk_reward_ratio: {config.risk_reward_ratio}")
+    log.info("")
+    log.info("[追踪止损]")
+    log.info(f"  trailing_stop_enabled: {config.trailing_stop_enabled}")
+    log.info(f"  breakeven_activation: {config.breakeven_activation}")
+    log.info(f"  trailing_stop_activation: {config.trailing_stop_activation}")
+    log.info(f"  trailing_stop_callback: {config.trailing_stop_callback}%")
+    log.info("")
+    log.info("[波动率过滤]")
+    log.info(f"  volatility_filter_enabled: {config.volatility_filter_enabled}")
+    log.info(f"  volatility_window: {config.volatility_window}s")
+    log.info(f"  max_volatility_pct: {config.max_volatility_pct}%")
+    log.info("")
+    log.info("[方向信号]")
+    log.info(f"  direction_signal_threshold: {config.direction_signal_threshold}")
+    log.info(f"  enable_short: {config.enable_short}")
+    log.info("")
+    log.info("[RSI过滤]")
+    log.info(f"  rsi_filter_enabled: {config.rsi_filter_enabled}")
+    log.info(f"  rsi_period: {config.rsi_period}")
+    log.info(f"  rsi_trend_threshold: {config.rsi_trend_threshold}")
+    log.info("")
+    log.info("[时段过滤]")
+    log.info(f"  time_filter_enabled: {config.time_filter_enabled}")
+    log.info(f"  optimal_hours_start: {config.optimal_hours_start}")
+    log.info(f"  optimal_hours_end: {config.optimal_hours_end}")
+    log.info(f"  weekend_multiplier: {config.weekend_multiplier}")
+    log.info("")
+    log.info("[Kelly仓位管理]")
+    log.info(f"  kelly_enabled: {config.kelly_enabled}")
+    log.info(f"  kelly_fraction: {config.kelly_fraction}")
+    log.info(f"  max_position_increase_pct: {config.max_position_increase_pct*100:.0f}%")
+    log.info("")
+    log.info("[回撤控制]")
+    log.info(f"  drawdown_control_enabled: {config.drawdown_control_enabled}")
+    log.info(f"  max_daily_loss_pct: {config.max_daily_loss_pct*100:.2f}%")
+    log.info(f"  max_total_loss_pct: {config.max_total_loss_pct*100:.2f}%")
+    log.info("")
+    log.info("[平仓设置]")
+    log.info(f"  exit_order_type: {config.exit_order_type}")
+    log.info("")
+    log.info("[v3.2 方向一致性与动量过滤]")
+    log.info(f"  direction_trend_confirm: {config.direction_trend_confirm}")
+    log.info(f"  price_momentum_window: {config.price_momentum_window}")
+    log.info(f"  price_momentum_min_slope: {config.price_momentum_min_slope}%")
+    log.info("")
+    log.info("=" * 60)
 
 
 async def main():
@@ -1366,6 +1521,24 @@ async def main():
     config.max_wait_seconds = float(os.getenv("MAX_WAIT_SECONDS", "30.0"))
     config.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.015"))
 
+    # 任务2: 补齐.env参数读取
+    config.check_interval = float(os.getenv("CHECK_INTERVAL", "0.5"))
+    config.breakeven_activation = float(os.getenv("BREAKEVEN_ACTIVATION", "1.0"))
+    config.volatility_window = int(os.getenv("VOLATILITY_WINDOW", "10"))
+    config.early_exit_stagnation_threshold = float(os.getenv("EARLY_EXIT_STAGNATION_THRESHOLD", "0.02"))
+    config.time_filter_enabled = os.getenv("TIME_FILTER_ENABLED", "true").lower() == "true"
+    config.optimal_hours_start = int(os.getenv("OPTIMAL_HOURS_START", "8"))
+    config.optimal_hours_end = int(os.getenv("OPTIMAL_HOURS_END", "21"))
+    config.weekend_multiplier = float(os.getenv("WEEKEND_MULTIPLIER", "0.5"))
+    config.kelly_fraction = float(os.getenv("KELLY_FRACTION", "0.25"))
+    config.max_position_increase_pct = float(os.getenv("MAX_POSITION_INCREASE_PCT", "0.50"))
+    config.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
+    config.max_total_loss_pct = float(os.getenv("MAX_TOTAL_LOSS_PCT", "0.10"))
+    config.exit_order_type = os.getenv("EXIT_ORDER_TYPE", "limit")
+    config.direction_trend_confirm = os.getenv("DIRECTION_TREND_CONFIRM", "true").lower() == "true"
+    config.price_momentum_window = int(os.getenv("PRICE_MOMENTUM_WINDOW", "6"))
+    config.price_momentum_min_slope = float(os.getenv("PRICE_MOMENTUM_MIN_SLOPE", "0.0"))
+
     client.client_id_format = os.getenv("CLIENT_ID_FORMAT", "rpi")
     config.trend_filter_enabled = os.getenv("TREND_FILTER", "true").lower() == "true"
     config.volatility_filter_enabled = os.getenv("VOLATILITY_FILTER", "true").lower() == "true"
@@ -1399,16 +1572,14 @@ async def main():
     config.max_position_pct = float(os.getenv("MAX_POSITION_PCT", "0.30"))
     config.drawdown_control_enabled = os.getenv("DRAWDOWN_CONTROL", "true").lower() == "true"
 
-    log.info(f"交易大小: {config.trade_size} BTC")
-    log.info(f"做空交易: {'开启' if config.enable_short else '关闭'}")
-    log.info(f"动态止损: {'开启' if config.dynamic_stop_loss else '关闭'} ({config.dynamic_stop_loss_min*100:.0f}%-{config.dynamic_stop_loss_max*100:.0f}%)")
-    log.info("=" * 30)
+    # 任务5: 打印最终生效配置
+    print_final_config(config)
 
     bot = RPIBot(client, config, account_manager)
 
     def signal_handler(sig, frame):
         global _shutdown_requested
-        log.info("\n收到退出信号...")
+        log.info("\n收到退出信号")
         _shutdown_requested = True
 
     signal.signal(signal.SIGINT, signal_handler)
