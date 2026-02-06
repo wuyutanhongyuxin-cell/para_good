@@ -270,7 +270,8 @@ class ParadexInteractiveClient:
                         positions = data.get("results", [])
                         if market:
                             positions = [p for p in positions if p.get("market") == market]
-                        return [p for p in positions if p.get("status") != "CLOSED" and float(p.get("size", 0)) > 0]
+                        # 使用 >= 0.00001 避免浮点精度问题遗漏小仓位
+                        return [p for p in positions if p.get("status") != "CLOSED" and float(p.get("size", 0)) >= 0.00001]
             return []
         except Exception as e:
             log.error(f"获取持仓失败: {e}")
@@ -461,7 +462,8 @@ class ParadexInteractiveClient:
                     continue
                 size = pos.get("size", "0")
                 side = pos.get("side", "")
-                if float(size) == 0:
+                # 避免浮点精度问题，用小阈值判断
+                if float(size) < 0.00001:
                     continue
                 close_side = "SELL" if side == "LONG" else "BUY"
                 if await self.place_market_order(pos_market, close_side, size, reduce_only=True):
@@ -1123,13 +1125,21 @@ class RPIBot:
             log.info(f"[平仓] Taker: 市价{'卖出' if is_long else '买入'} {size} BTC @ 约${best_price:.1f} ({exit_type_reason})")
             close_result = await self.client.place_market_order(market=market, side=close_side, size=size, reduce_only=True)
 
-        # 兜底平仓
+        # 兜底平仓 - 从API获取实际持仓大小
         if not close_result:
             positions = await self.client.get_positions(market)
             if positions:
                 actual_size = positions[0].get("size", size)
-                log.info(f"[平仓] 兜底: 市价单 {close_side} {actual_size} BTC")
-                close_result = await self.client.place_market_order(market=market, side=close_side, size=str(actual_size), reduce_only=True)
+                # 验证size有效性
+                try:
+                    size_float = float(actual_size)
+                    if size_float >= 0.00001:
+                        log.info(f"[平仓] 兜底: 市价单 {close_side} {actual_size} BTC")
+                        close_result = await self.client.place_market_order(market=market, side=close_side, size=str(actual_size), reduce_only=True)
+                    else:
+                        log.info(f"[平仓] 持仓已平完 (size={actual_size})")
+                except (ValueError, TypeError):
+                    log.warning(f"[平仓] 无效的持仓大小: {actual_size}")
 
         # 计算盈亏
         pnl = 0.0
