@@ -150,6 +150,12 @@ class RPIConfig:
     max_daily_loss_pct: float = 0.03
     max_total_loss_pct: float = 0.10
 
+    # 价格位置过滤 (避免追高追低)
+    price_position_filter_enabled: bool = True
+    price_position_high_threshold: float = 0.80  # 高于80%不做多
+    price_position_low_threshold: float = 0.20   # 低于20%不做空
+    price_position_lookback: int = 20            # 回溯窗口
+
     # ===== v3.1 做空交易配置 =====
     enable_short: bool = True
 
@@ -825,6 +831,38 @@ class RPIBot:
                 return False, f"总回撤 {total_loss:.1%} 超过阈值 {self.config.max_total_loss_pct*100:.1f}%"
         return True, ""
 
+    def _check_price_position(self, current_price: float, prices: List[float], direction: str) -> tuple:
+        """
+        检查当前价格在最近N根K线中的位置
+        避免追高做多、追低做空
+        """
+        if not self.config.price_position_filter_enabled:
+            return True, ""
+
+        if len(prices) < self.config.price_position_lookback:
+            return True, "价格数据不足"
+
+        # 取最近N个价格
+        recent = prices[-self.config.price_position_lookback:]
+        highest = max(recent)
+        lowest = min(recent)
+
+        if highest <= lowest:
+            return True, "价格无波动"
+
+        # 计算当前价格在区间中的位置百分比 (0=最低, 1=最高)
+        position_pct = (current_price - lowest) / (highest - lowest)
+
+        # 做多时：价格位置不能太高（避免追高）
+        if direction == "LONG" and position_pct > self.config.price_position_high_threshold:
+            return False, f"价格位置过高 ({position_pct*100:.1f}% > {self.config.price_position_high_threshold*100:.0f}%)，不追高"
+
+        # 做空时：价格位置不能太低（避免追低）
+        if direction == "SHORT" and position_pct < self.config.price_position_low_threshold:
+            return False, f"价格位置过低 ({position_pct*100:.1f}% < {self.config.price_position_low_threshold*100:.0f}%)，不追低"
+
+        return True, f"价格位置={position_pct*100:.1f}%"
+
     def _get_direction_signal(self, imbalance: Optional[float]) -> tuple:
         """获取方向信号 - 支持做多和做空"""
         if imbalance is None:
@@ -1078,10 +1116,20 @@ class RPIBot:
                             max_wait += self.config.hold_extension_seconds
                             extension_used = True
                             log.info(f"[延长持仓] 盈利趋势良好 (+{current_profit_pct*100:.2f}%)，延长{self.config.hold_extension_seconds:.0f}秒")
-                        elif is_stagnant and current_profit_pct <= 0:
-                            log.info(f"[提前平仓] 行情停滞 (波动<{self.config.early_exit_stagnation_threshold}%)，提前退出")
-                            exit_reason = "early_exit_stagnant"
-                            break
+                        elif is_stagnant:
+                            # 行情停滞时的策略：
+                            # 1. 盈利 → 提前退出保住利润
+                            # 2. 小亏损(<0.3%) → 提前止损
+                            # 3. 大亏损(>=0.3%) → 继续等待，可能反转或触发止损
+                            if current_profit_pct > 0.001:  # 盈利>0.1%
+                                log.info(f"[提前平仓] 行情停滞且盈利 (+{current_profit_pct*100:.2f}%)，提前退出")
+                                exit_reason = "early_exit_stagnant"
+                                break
+                            elif current_profit_pct < 0 and abs(current_profit_pct) < 0.003:  # 小亏损<0.3%
+                                log.info(f"[提前平仓] 行情停滞且小亏损 ({current_profit_pct*100:.2f}%)，提前止损")
+                                exit_reason = "early_exit_stagnant"
+                                break
+                            # else: 大亏损时继续等待，不提前退出
 
                 await asyncio.sleep(self.config.check_interval)
             else:
@@ -1199,6 +1247,11 @@ class RPIBot:
         # 回撤检查
         drawdown_ok, drawdown_reason = self._check_drawdown(balance)
         if not drawdown_ok:
+            # 回撤超限：先平掉所有持仓，再停止新交易
+            positions = await self.get_positions()
+            if positions:
+                log.warning(f"[回撤超限] {drawdown_reason}，自动平掉所有持仓")
+                await self.close_all_positions()
             return False, f"回撤限制: {drawdown_reason}"
 
         # 获取市场价格
@@ -1340,6 +1393,14 @@ class RPIBot:
             confirmed, filter_reason = self._is_signal_confirmed(self.price_history, direction)
             if not confirmed:
                 return False, f"信号未确认: {filter_reason}"
+
+        # 价格位置过滤 (避免追高追低)
+        if vol_data and "prices" in vol_data:
+            price_ok, price_reason = self._check_price_position(bid, vol_data["prices"], direction)
+            if not price_ok:
+                return False, f"价格位置过滤: {price_reason}"
+            if price_reason:
+                log.info(f"[价格位置] {price_reason}")
 
         # 仓位计算
         size = base_size
@@ -1584,6 +1645,12 @@ def print_final_config(config: RPIConfig):
     log.info(f"  max_daily_loss_pct: {config.max_daily_loss_pct*100:.2f}%")
     log.info(f"  max_total_loss_pct: {config.max_total_loss_pct*100:.2f}%")
     log.info("")
+    log.info("[价格位置过滤 - 避免追高追低]")
+    log.info(f"  price_position_filter_enabled: {config.price_position_filter_enabled}")
+    log.info(f"  high_threshold: {config.price_position_high_threshold*100:.0f}% (高于此不做多)")
+    log.info(f"  low_threshold: {config.price_position_low_threshold*100:.0f}% (低于此不做空)")
+    log.info(f"  lookback: {config.price_position_lookback}个价格采样")
+    log.info("")
     log.info("[v3.3 Maker优先入场]")
     log.info(f"  entry_order_type: {config.entry_order_type}")
     log.info(f"  entry_post_only: {config.entry_post_only}")
@@ -1712,6 +1779,12 @@ async def main():
     config.kelly_enabled = os.getenv("KELLY_ENABLED", "true").lower() == "true"
     config.max_position_pct = float(os.getenv("MAX_POSITION_PCT", "0.30"))
     config.drawdown_control_enabled = os.getenv("DRAWDOWN_CONTROL", "true").lower() == "true"
+
+    # 价格位置过滤
+    config.price_position_filter_enabled = os.getenv("PRICE_POSITION_FILTER", "true").lower() == "true"
+    config.price_position_high_threshold = float(os.getenv("PRICE_POSITION_HIGH_THRESHOLD", "0.80"))
+    config.price_position_low_threshold = float(os.getenv("PRICE_POSITION_LOW_THRESHOLD", "0.20"))
+    config.price_position_lookback = int(os.getenv("PRICE_POSITION_LOOKBACK", "20"))
 
     # 任务5: 打印最终生效配置
     print_final_config(config)
