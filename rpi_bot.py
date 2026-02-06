@@ -77,13 +77,11 @@ class RPIConfig:
 
     # 止盈止损 (多空共用)
     stop_loss_pct: float = 0.015
-    min_profit_pct: float = 0.005
     max_wait_seconds: float = 30.0
     check_interval: float = 0.5
 
     # 趋势过滤
     trend_filter_enabled: bool = True
-    orderbook_imbalance_threshold: float = 0.0
 
     # 波动率过滤
     volatility_filter_enabled: bool = True
@@ -1630,6 +1628,12 @@ async def main():
     config.max_wait_seconds = float(os.getenv("MAX_WAIT_SECONDS", "30.0"))
     config.stop_loss_pct = float(os.getenv("STOP_LOSS_PCT", "0.015"))
 
+    # 限速设置
+    config.limits_per_second = int(os.getenv("LIMITS_PER_SECOND", "2"))
+    config.limits_per_minute = int(os.getenv("LIMITS_PER_MINUTE", "30"))
+    config.limits_per_hour = int(os.getenv("LIMITS_PER_HOUR", "300"))
+    config.limits_per_day = int(os.getenv("LIMITS_PER_DAY", "1000"))
+
     # 任务2: 补齐.env参数读取
     config.check_interval = float(os.getenv("CHECK_INTERVAL", "0.5"))
     config.breakeven_activation = float(os.getenv("BREAKEVEN_ACTIVATION", "1.0"))
@@ -1680,6 +1684,8 @@ async def main():
     config.rsi_filter_enabled = os.getenv("RSI_FILTER_ENABLED", "true").lower() == "true"
     config.rsi_period = int(os.getenv("RSI_PERIOD", "14"))
     config.rsi_trend_threshold = float(os.getenv("RSI_TREND_THRESHOLD", "50.0"))
+    config.rsi_overbought = float(os.getenv("RSI_OVERBOUGHT", "70.0"))
+    config.rsi_oversold = float(os.getenv("RSI_OVERSOLD", "30.0"))
     config.position_smoothing_enabled = os.getenv("POSITION_SMOOTHING_ENABLED", "true").lower() == "true"
 
     # v3.1 做空配置
