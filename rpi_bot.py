@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-RPI Bot - 100% RPI 触发交易机器人 (v3.2 双向交易版)
+RPI Bot - 100% RPI 触发交易机器人 (v3.3 Maker优先版)
 
 核心原理:
     RPI (Rebate Point Index) 只出现在 TAKER 订单上
@@ -17,6 +17,14 @@ v3.2 新增功能:
     - 方向一致性过滤 (订单簿方向需与微趋势一致)
     - 动量过滤 (线性回归斜率检查)
     - 完整的环境变量配置支持
+
+v3.3 新增功能 (Maker优先):
+    - 入场改为限价单优先 (POST_ONLY)
+    - 支持挂单价格偏移 (offset_ticks)
+    - 限价单超时撤单与重挂机制 (最多重挂N次)
+    - 点差超限时禁止Taker fallback
+    - 平仓也支持Maker优先 (非止损情况)
+    - 增强日志: 区分Maker/Taker入场与退出
 
 基于 pp2 项目改进: https://github.com/wuyutanhongyuxin-cell/pp2
 """
@@ -111,8 +119,18 @@ class RPIConfig:
 
     # 研究优化参数
     exit_order_type: str = "limit"
+    exit_post_only: bool = True
+    exit_price_offset_ticks: int = 0
     direction_signal_threshold: float = 0.3
     risk_reward_ratio: float = 2.0
+
+    # ===== v3.3 Maker优先配置 =====
+    entry_order_type: str = "limit"
+    entry_post_only: bool = True
+    entry_price_offset_ticks: int = 0
+    entry_order_timeout_seconds: float = 3.0
+    entry_requote_max: int = 2
+    market_spread_limit_pct: float = 0.006
 
     # 时段过滤
     time_filter_enabled: bool = True
@@ -545,11 +563,11 @@ class AccountManager:
 
 
 # =============================================================================
-# RPI 交易机器人 (v3.2 双向交易版)
+# RPI 交易机器人 (v3.3 Maker优先版)
 # =============================================================================
 
 class RPIBot:
-    """RPI 机器人 v3.2 - 支持双向交易和动量过滤"""
+    """RPI 机器人 v3.3 - Maker优先入场与退出"""
 
     def __init__(self, client: ParadexInteractiveClient, config: RPIConfig,
                  account_manager: Optional[AccountManager] = None):
@@ -836,7 +854,7 @@ class RPIBot:
     async def _execute_trade(self, direction: str, market: str, size: str, bid: float, ask: float,
                               stop_loss_pct: float, take_profit_pct: float) -> tuple:
         """
-        执行交易 - 统一的多空交易逻辑
+        执行交易 - 统一的多空交易逻辑 (v3.3 Maker优先)
 
         Args:
             direction: "LONG" 或 "SHORT"
@@ -851,18 +869,79 @@ class RPIBot:
             (成功标志, 退出原因, PnL)
         """
         is_long = direction == "LONG"
+        entry_side = "BUY" if is_long else "SELL"
+        open_result = None
+        entry_price = ask if is_long else bid
+        is_maker_entry = False
 
-        # 开仓
-        if is_long:
-            entry_side = "BUY"
-            entry_price = ask
-            log.info(f"[开多单] 市价买入 {size} BTC @ 约${entry_price:.1f}")
-        else:
-            entry_side = "SELL"
-            entry_price = bid
-            log.info(f"[开空单] 市价卖出 {size} BTC @ 约${entry_price:.1f}")
+        # ===== v3.3 Maker优先入场逻辑 =====
+        if self.config.entry_order_type == "limit":
+            # 计算挂单价格: 做多用bid(买一), 做空用ask(卖一)
+            # offset_ticks > 0 表示更激进(更接近对手价)
+            tick_size = 0.1  # BTC-USD-PERP tick size
+            if is_long:
+                limit_price = bid + self.config.entry_price_offset_ticks * tick_size
+            else:
+                limit_price = ask - self.config.entry_price_offset_ticks * tick_size
 
-        open_result = await self.client.place_market_order(market=market, side=entry_side, size=size, reduce_only=False)
+            log.info(f"[开{'多' if is_long else '空'}单] Maker优先: 限价{'买入' if is_long else '卖出'} {size} BTC @ ${limit_price:.1f} (best_{'bid' if is_long else 'ask'}={bid if is_long else ask:.1f}, offset={self.config.entry_price_offset_ticks})")
+
+            # 重挂循环
+            for attempt in range(self.config.entry_requote_max + 1):
+                if attempt > 0:
+                    # 重新获取BBO
+                    new_bbo = await self.client.get_bbo(market)
+                    if new_bbo:
+                        bid, ask = new_bbo["bid"], new_bbo["ask"]
+                        if is_long:
+                            limit_price = bid + self.config.entry_price_offset_ticks * tick_size
+                        else:
+                            limit_price = ask - self.config.entry_price_offset_ticks * tick_size
+                    log.info(f"[重挂] 第{attempt}次重挂 @ ${limit_price:.1f}")
+
+                # 下限价单
+                limit_result = await self.client.place_limit_order(
+                    market=market,
+                    side=entry_side,
+                    size=size,
+                    price=str(round(limit_price, 1)),
+                    post_only=self.config.entry_post_only,
+                    reduce_only=False
+                )
+
+                if not limit_result:
+                    log.warning(f"[开仓] 限价单提交失败, 尝试 {attempt + 1}/{self.config.entry_requote_max + 1}")
+                    continue
+
+                order_id = limit_result.get("id")
+                log.info(f"[开仓] 限价单已挂 order_id={order_id}, 等待成交 (超时={self.config.entry_order_timeout_seconds}s)")
+
+                # 等待成交
+                fill_result = await self.client.wait_order_fill(order_id, timeout_seconds=self.config.entry_order_timeout_seconds)
+
+                if fill_result:
+                    open_result = fill_result
+                    entry_price = float(fill_result.get("avg_fill_price", limit_price))
+                    is_maker_entry = True
+                    log.info(f"[开仓] Maker成交! @ ${entry_price:.1f}")
+                    break
+                else:
+                    log.info(f"[开仓] 限价单超时未成交, 已撤单 (尝试 {attempt + 1}/{self.config.entry_requote_max + 1})")
+
+            # 限价单全部失败, 检查是否允许fallback到市价单
+            if not open_result:
+                current_spread_pct = (ask - bid) / bid * 100
+                if current_spread_pct > self.config.market_spread_limit_pct:
+                    log.warning(f"[开仓] Maker入场失败, 当前spread={current_spread_pct:.4f}% > 限制{self.config.market_spread_limit_pct:.4f}%, 禁止吃单")
+                    return False, "maker_failed_spread_too_wide", 0
+                else:
+                    log.info(f"[开仓] Maker入场失败, spread={current_spread_pct:.4f}% <= {self.config.market_spread_limit_pct:.4f}%, 允许Taker fallback")
+
+        # 市价单入场 (原始逻辑或Maker失败后的fallback)
+        if not open_result:
+            entry_price = ask if is_long else bid
+            log.info(f"[开{'多' if is_long else '空'}单] 市价{'买入' if is_long else '卖出'} {size} BTC @ 约${entry_price:.1f}")
+            open_result = await self.client.place_market_order(market=market, side=entry_side, size=size, reduce_only=False)
 
         if not open_result:
             return False, f"{'开多' if is_long else '开空'}失败", 0
@@ -874,11 +953,12 @@ class RPIBot:
             self.short_trades += 1
 
         flags = open_result.get("flags", [])
+        entry_type_str = "Maker" if is_maker_entry else "Taker"
         if "rpi" in [f.lower() for f in flags]:
             self.rpi_trades += 1
-            log.info(f"  -> RPI! flags={flags}")
+            log.info(f"  -> [{entry_type_str}] RPI! flags={flags}")
         else:
-            log.info(f"  -> flags={flags}")
+            log.info(f"  -> [{entry_type_str}] flags={flags}")
 
         # 计算止盈止损价格
         if is_long:
@@ -1006,26 +1086,43 @@ class RPIBot:
         close_side = "SELL" if is_long else "BUY"
         close_result = None
         actual_exit_price = best_price
+        is_maker_exit = False
+        tick_size = 0.1
 
-        # 限价单平仓（非止损情况）
-        if self.config.exit_order_type == "limit" and exit_reason not in ["stop_loss", "trailing_stop"]:
-            log.info(f"[平仓] 限价单{'卖出' if is_long else '买入'} {size} BTC @ ${best_price:.1f}")
+        # ===== v3.3 Maker优先平仓 (非紧急止损情况) =====
+        if self.config.exit_order_type == "limit" and exit_reason not in ["stop_loss", "trailing_stop", "shutdown"]:
+            # 获取最新BBO用于挂单
+            exit_bbo = await self.client.get_bbo(market)
+            if exit_bbo:
+                # 做多平仓用ask挂卖单, 做空平仓用bid挂买单 (确保Maker)
+                if is_long:
+                    exit_limit_price = exit_bbo["ask"] + self.config.exit_price_offset_ticks * tick_size
+                else:
+                    exit_limit_price = exit_bbo["bid"] - self.config.exit_price_offset_ticks * tick_size
+            else:
+                exit_limit_price = best_price
+
+            log.info(f"[平仓] Maker优先: 限价{'卖出' if is_long else '买入'} {size} BTC @ ${exit_limit_price:.1f} (offset={self.config.exit_price_offset_ticks})")
             limit_result = await self.client.place_limit_order(
                 market=market, side=close_side, size=size,
-                price=str(round(best_price, 1)), post_only=True, reduce_only=True
+                price=str(round(exit_limit_price, 1)),
+                post_only=self.config.exit_post_only,
+                reduce_only=True
             )
             if limit_result:
                 fill = await self.client.wait_order_fill(limit_result.get("id"), timeout_seconds=5.0)
                 if fill:
                     close_result = fill
-                    actual_exit_price = float(fill.get("avg_fill_price", best_price))
-                    log.info(f"  -> 限价单成交 @ ${actual_exit_price:.1f}")
+                    actual_exit_price = float(fill.get("avg_fill_price", exit_limit_price))
+                    is_maker_exit = True
+                    log.info(f"  -> [Maker] 限价单成交 @ ${actual_exit_price:.1f}")
                 else:
-                    log.info("  -> 限价单超时，切换市价单")
+                    log.info("  -> 限价单超时未成交，切换Taker平仓")
 
-        # 市价单平仓
+        # Taker市价单平仓 (fallback或紧急止损)
         if not close_result:
-            log.info(f"[平仓] 市价{'卖出' if is_long else '买入'} {size} BTC @ 约${best_price:.1f}")
+            exit_type_reason = "止损/追踪止损" if exit_reason in ["stop_loss", "trailing_stop"] else "Maker超时"
+            log.info(f"[平仓] Taker: 市价{'卖出' if is_long else '买入'} {size} BTC @ 约${best_price:.1f} ({exit_type_reason})")
             close_result = await self.client.place_market_order(market=market, side=close_side, size=size, reduce_only=True)
 
         # 兜底平仓
@@ -1033,6 +1130,7 @@ class RPIBot:
             positions = await self.client.get_positions(market)
             if positions:
                 actual_size = positions[0].get("size", size)
+                log.info(f"[平仓] 兜底: 市价单 {close_side} {actual_size} BTC")
                 close_result = await self.client.place_market_order(market=market, side=close_side, size=str(actual_size), reduce_only=True)
 
         # 计算盈亏
@@ -1040,9 +1138,10 @@ class RPIBot:
         if close_result:
             self._record_trade()
             flags = close_result.get("flags", [])
+            exit_type_str = "Maker" if is_maker_exit else "Taker"
             if "rpi" in [f.lower() for f in flags]:
                 self.rpi_trades += 1
-                log.info(f"  -> RPI! flags={flags}")
+                log.info(f"  -> [{exit_type_str}] RPI! flags={flags}")
 
             if is_long:
                 pnl = (actual_exit_price - entry_price) * float(size)
@@ -1318,18 +1417,19 @@ class RPIBot:
         self.start_time = time.time()
 
         log.info("=" * 60)
-        log.info("RPI Bot v3.2 - 双向交易版")
+        log.info("RPI Bot v3.3 - Maker优先版")
         log.info("=" * 60)
         log.info(f"市场: {self.config.market}")
         log.info(f"交易大小: {self.config.trade_size} BTC")
         log.info("")
-        log.info("v3.2 功能:")
+        log.info("v3.3 功能:")
+        log.info(f"  - Maker优先入场: {'开启' if self.config.entry_order_type == 'limit' else '关闭'}")
+        log.info(f"  - 入场超时重挂: {self.config.entry_order_timeout_seconds}s, 最多{self.config.entry_requote_max}次")
+        log.info(f"  - Taker禁入阈值: spread > {self.config.market_spread_limit_pct:.4f}%")
+        log.info(f"  - Maker优先平仓: {'开启' if self.config.exit_order_type == 'limit' else '关闭'}")
         log.info(f"  - 做空交易: {'开启' if self.config.enable_short else '关闭'}")
         log.info(f"  - 追踪止损: {'开启' if self.config.trailing_stop_enabled else '关闭'}")
-        log.info(f"  - 智能持仓: {'开启' if self.config.smart_hold_enabled else '关闭'}")
-        log.info(f"  - RSI过滤: {'开启' if self.config.rsi_filter_enabled else '关闭'}")
         log.info(f"  - 方向一致性过滤: {'开启' if self.config.direction_trend_confirm else '关闭'}")
-        log.info(f"  - 动量过滤: window={self.config.price_momentum_window}, min_slope={self.config.price_momentum_min_slope}%")
         log.info("=" * 60)
 
         if not await self.client.authenticate_interactive():
@@ -1471,8 +1571,18 @@ def print_final_config(config: RPIConfig):
     log.info(f"  max_daily_loss_pct: {config.max_daily_loss_pct*100:.2f}%")
     log.info(f"  max_total_loss_pct: {config.max_total_loss_pct*100:.2f}%")
     log.info("")
-    log.info("[平仓设置]")
+    log.info("[v3.3 Maker优先入场]")
+    log.info(f"  entry_order_type: {config.entry_order_type}")
+    log.info(f"  entry_post_only: {config.entry_post_only}")
+    log.info(f"  entry_price_offset_ticks: {config.entry_price_offset_ticks}")
+    log.info(f"  entry_order_timeout_seconds: {config.entry_order_timeout_seconds}s")
+    log.info(f"  entry_requote_max: {config.entry_requote_max}")
+    log.info(f"  market_spread_limit_pct: {config.market_spread_limit_pct:.4f}% (Taker禁入阈值)")
+    log.info("")
+    log.info("[v3.3 Maker优先平仓]")
     log.info(f"  exit_order_type: {config.exit_order_type}")
+    log.info(f"  exit_post_only: {config.exit_post_only}")
+    log.info(f"  exit_price_offset_ticks: {config.exit_price_offset_ticks}")
     log.info("")
     log.info("[v3.2 方向一致性与动量过滤]")
     log.info(f"  direction_trend_confirm: {config.direction_trend_confirm}")
@@ -1534,6 +1644,17 @@ async def main():
     config.max_daily_loss_pct = float(os.getenv("MAX_DAILY_LOSS_PCT", "0.03"))
     config.max_total_loss_pct = float(os.getenv("MAX_TOTAL_LOSS_PCT", "0.10"))
     config.exit_order_type = os.getenv("EXIT_ORDER_TYPE", "limit")
+
+    # v3.3 Maker优先配置
+    config.entry_order_type = os.getenv("ENTRY_ORDER_TYPE", "limit")
+    config.entry_post_only = os.getenv("ENTRY_POST_ONLY", "true").lower() == "true"
+    config.entry_price_offset_ticks = int(os.getenv("ENTRY_PRICE_OFFSET_TICKS", "0"))
+    config.entry_order_timeout_seconds = float(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "3.0"))
+    config.entry_requote_max = int(os.getenv("ENTRY_REQUOTE_MAX", "2"))
+    config.market_spread_limit_pct = float(os.getenv("MARKET_SPREAD_LIMIT_PCT", "0.006"))
+    config.exit_post_only = os.getenv("EXIT_POST_ONLY", "true").lower() == "true"
+    config.exit_price_offset_ticks = int(os.getenv("EXIT_PRICE_OFFSET_TICKS", "0"))
+
     config.direction_trend_confirm = os.getenv("DIRECTION_TREND_CONFIRM", "true").lower() == "true"
     config.price_momentum_window = int(os.getenv("PRICE_MOMENTUM_WINDOW", "6"))
     config.price_momentum_min_slope = float(os.getenv("PRICE_MOMENTUM_MIN_SLOPE", "0.0"))
