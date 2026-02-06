@@ -404,6 +404,11 @@ class ParadexInteractiveClient:
                         if resp.status == 200:
                             order = await resp.json()
                             if order.get("status") == "CLOSED":
+                                # 检查是否完全成交（避免部分成交导致残留仓位）
+                                remaining = float(order.get("remaining_size", 0))
+                                if remaining >= 0.00001:  # 有残留未成交
+                                    log.warning(f"[部分成交] 订单{order_id}部分成交，剩余{remaining} BTC未成交")
+                                    return None  # 视为失败，避免残留仓位
                                 return order
                             if order.get("status") in ["CANCELED", "REJECTED"]:
                                 return None
