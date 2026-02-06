@@ -1248,10 +1248,10 @@ class RPIBot:
         drawdown_ok, drawdown_reason = self._check_drawdown(balance)
         if not drawdown_ok:
             # 回撤超限：先平掉所有持仓，再停止新交易
-            positions = await self.get_positions()
+            positions = await self.client.get_positions()
             if positions:
                 log.warning(f"[回撤超限] {drawdown_reason}，自动平掉所有持仓")
-                await self.close_all_positions()
+                await self.client.close_all_positions()
             return False, f"回撤限制: {drawdown_reason}"
 
         # 获取市场价格
