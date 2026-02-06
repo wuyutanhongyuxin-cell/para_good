@@ -1340,10 +1340,10 @@ class RPIBot:
         size = base_size
         if self.config.kelly_enabled:
             kelly_size = self._calculate_kelly_size(balance, float(base_size))
-            size = str(round(self._apply_position_smoothing(kelly_size), 6))
+            size = str(round(self._apply_position_smoothing(kelly_size), 5))  # Paradex要求5位小数
 
         if time_mult < 1.0:
-            size = str(round(float(size) * time_mult, 6))
+            size = str(round(float(size) * time_mult, 5))  # Paradex要求5位小数
             log.info(f"[时段] 仓位调整: x{time_mult} -> {size}")
 
         # 仓位硬上限检查
@@ -1352,7 +1352,7 @@ class RPIBot:
         max_position_value = balance * self.config.max_position_pct * leverage
         if position_value > max_position_value:
             original_size = size
-            size = str(round(max_position_value / ask, 6))
+            size = str(round(max_position_value / ask, 5))  # Paradex要求5位小数
             log.info(f"[仓位上限] 目标仓位超出上限，已缩减为 {size} BTC (原: {original_size} BTC, 上限: {self.config.max_position_pct*100:.0f}%余额)")
 
         # 余额检查
